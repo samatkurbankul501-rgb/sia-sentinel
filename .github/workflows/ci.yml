@@ -4,7 +4,9 @@ on:
   push:
     branches: [ main, develop, master ]
   pull_request:
-    branches: [ main ]
+    # Второй фронт (найдено 2026-09-30): было только [ main], а репозиторий
+    # живёт на master — PR не запускали CI вообще, гейт молча не работал.
+    branches: [ main, master ]
 
 jobs:
   test:
