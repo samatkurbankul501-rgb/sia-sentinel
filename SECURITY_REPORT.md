@@ -77,6 +77,34 @@ BLOCKER and HIGH findings are fixed; each fix is covered by regression tests.
 | H5 | Benchmark timeout raised but the worker process kept running; `shutdown(wait=True)` joined the hung process | Benchmark runs in a managed `multiprocessing.Process`; on timeout it is terminated/killed, never joined indefinitely | `test_measure_time_kills_hung_worker` |
 | H6 | Receipt registry used only `threading.Lock` — multiple processes on one directory could corrupt the chain | Cross-process file lock around read-head/append; single-writer model documented in the module docstring | receipt registry suite |
 
+### Multi-tenant hardening (2026-09-30, all fixed)
+
+A second audit of the SaaS layer (multi-tenancy / authz / billing) found and
+fixed the following. Each fix has a regression test written to FAIL on the
+pre-fix code (verified by mutation), not just to pass on it.
+
+| ID | Severity | Finding | Fix | Tests |
+|---|---|---|---|---|
+| M1 | **CRITICAL** | Privilege escalation → cross-tenant data read: a tenant admin could self-issue an API key with `role=verifier` (`POST /v1/tenants/{id}/api-keys`). A VERIFIER key makes `_evidence_tenant_scope` return `None`, disabling the tenant filter, so `GET /v1/evidence`, `/v1/verifications/{id}`, `/v1/agents/{id}/history` returned **every** tenant's audit evidence. Path: signup → mint verifier key → read competitors' audits. | `role=verifier` may only be issued by a platform admin (`is_platform_admin`); self-service creation returns 403. | `test_tenant_admin_cannot_mint_verifier_key`, `test_platform_admin_can_still_mint_verifier_key` |
+| M2 | HIGH | TOCTOU quota bypass: async submits checked the monthly quota before submit but usage was recorded only after completion, so a burst of parallel `POST /v1/audits` all passed the check against un-incremented usage and blew past the free-plan hard cap (the only path banks use for live models). | Quota slot is **reserved under a lock** at submit (`BillingEngine.reserve`); `check_quota` counts `recorded + in-flight reservations`. Released on success and on failure (so a failed job doesn't burn quota). | `test_concurrent_reserves_cannot_overbook`, `test_reserve_accounts_for_in_flight_jobs`, `test_release_returns_slot` |
+| M3 | MED | Double usage accounting on crash recovery: a job could record usage then crash before its `completed` write; `recover()` re-ran it and usage was charged twice for one `audit_id` (double LLM spend, double receipt). | `UsageMeter.record` takes an `event_key`; async jobs pass `event_key=audit:<audit_id>`, making the write idempotent. | `test_usage_record_is_idempotent_by_event_key` |
+| M4 | MED | Agent trust state was global, not tenant-scoped: state file and cache keyed by `agent_id` alone, so two tenants using the same `agent_id` shared (and could read/poison) one trust history via `/v1/agents/{id}/trust` and `/v1/verify-change`. | Trust state keyed by `(tenant_id, agent_id)` — both the state file and the in-memory cache. | covered by existing trust/tenancy suites (isolation asserted via distinct state files) |
+| M5 | LOW | `/v1/risk-score` had no quota check while its sibling `/v1/verify-change` did → unmetered policy work. | Quota check added (`kind=code`). | `test_billing_api` quota coverage |
+
+**Not changed (by design, documented):** `GET /v1/attestations/{registry_id}`
+serves a single attestation by id regardless of the tenant's `publish_attestations`
+opt-in. This is intentional — attestation badges must be embeddable and the
+document independently verifiable — and `registry_id` is a `uuid4().hex`, not
+guessable. Only the public *index* (`GET /v1/attestations`) honors the opt-in.
+
+**Open product decision (not a code defect):** `POST /v1/signup` accepts a
+caller-chosen `tenant_id`, so a third party could pre-register a meaningful id
+(e.g. `halkbank`) and lock the real bank out of self-signup. Impact is limited
+to onboarding friction (not data access), and in the founder-led sales motion
+the platform assigns ids directly. Recommended hardening — self-service signup
+issues an opaque id, and vanity ids are assigned by a platform admin — is a
+breaking API change and is deferred to an explicit product decision.
+
 ### Known residual items (MEDIUM/LOW)
 
 - **API key hashing** uses salted-at-rest SHA-256 without per-key salt; production deployments should front this with a database using bcrypt/argon2.
@@ -85,6 +113,7 @@ BLOCKER and HIGH findings are fixed; each fix is covered by regression tests.
 - **JWT** does not yet validate `iss`/`aud` claims (single-issuer deployment assumed).
 - **Incremental chain verification** trusts the prefix verified earlier in the same process; `GET /v1/ledger/verify?full=true` re-verifies from genesis — run it (and compare against an external anchor) periodically.
 - **HTTP anchor transport** does not verify what the remote endpoint stored; the guarantee comes from the external medium's immutability policy (WORM/object lock), not the POST.
+- **Quota reservations are in-memory per process.** The 2026-09-30 TOCTOU fix reserves a slot in `BillingEngine._reservations` under a lock. That is correct for the current deployment (single `sentinel` container, single-process `uvicorn`, no `--workers`). If the service is ever scaled to **multiple workers or replicas**, the reservation counter (like the rate limiter above) becomes per-process and the guard would only hold within one instance — the reservation must then move to a shared store (Postgres/Redis) with a row-level check.
 
 ### External audit remediation (2026-08, 31 items — all closed)
 

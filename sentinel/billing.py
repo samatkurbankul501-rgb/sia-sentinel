@@ -14,10 +14,13 @@ overage-ставке и попадает в инвойс за месяц.
 - "audits" — аудиты kind=code и kind=llm_flow;
 - "optimizations" — прогоны Savings Autopilot (kind=optimize).
 
-Ограничение прототипа: квота проверяется в момент отправки запроса, а
-использование записывается после завершения аудита, поэтому при очень
-быстрой отправке нескольких асинхронных джобов лимит может быть слегка
-превышен (мягкая квота). Для синхронных запросов квота точная.
+Учёт и квота: у асинхронного пути (POST /v1/audits, /v1/optimize) слот
+квоты РЕЗЕРВИРУЕТСЯ под замком в момент submit (BillingEngine.reserve) и
+снимается по завершению джоба — успех (_run_audit_and_register) или падение
+(_notify_audit_failure). Это закрывает TOCTOU, из-за которого пачка
+параллельных submit'ов проходила по неинкрементированному usage и лимит
+free-плана обходился всплеском. Для синхронного /v1/audit квота точная и
+резерв не нужен.
 """
 from __future__ import annotations
 
@@ -194,6 +197,11 @@ class BillingEngine:
         )
         self._invoices: dict[str, Invoice] = {}
         self._lock = threading.Lock()
+        # key: (tenant_id, period, category) -> number of in-flight reservations
+        # (асинхронные аудиты уже приняты, но usage ещё не записан). Убирает
+        # TOCTOU: N параллельных submit'ов не могут все разом пройти проверку по
+        # неинкрементированному usage.
+        self._reservations: dict[tuple[str, str, str], int] = {}
         self._load()
 
     # === Тарифы ===
@@ -227,12 +235,25 @@ class BillingEngine:
 
         return usage
 
+    def _reserved(self, tenant_id: str, period: str, category: str) -> int:
+        with self._lock:
+            return self._reservations.get((tenant_id, period, category), 0)
+
+    def _effective_used(self, tenant_id: str, period: str, category: str) -> int:
+        """Записанное использование + незакрытые резервы (аудиты в полёте)."""
+        recorded = self.usage_for_period(tenant_id, period)[category]
+        return recorded + self._reserved(tenant_id, period, category)
+
     def check_quota(self, tenant_id: str, kind: str) -> QuotaCheck:
-        """Можно ли тенанту запустить флоу данного kind прямо сейчас."""
+        """Можно ли тенанту запустить флоу данного kind прямо сейчас.
+
+        Учитывает незакрытые резервы: параллельные submit'ы видят друг друга и
+        не могут одновременно пройти проверку по неинкрементированному usage.
+        """
         plan = self.get_plan(tenant_id)
         category = category_for_kind(kind)
         limit = plan.included.get(category)
-        used = self.usage_for_period(tenant_id, current_period())[category]
+        used = self._effective_used(tenant_id, current_period(), category)
 
         if limit is None or used < limit:
             return QuotaCheck(True, plan.name, category, used, limit)
@@ -259,6 +280,60 @@ class BillingEngine:
                 "Upgrade via POST /v1/billing/plan."
             ),
         )
+
+    def reserve(self, tenant_id: str, kind: str) -> QuotaCheck:
+        """Атомарно резервирует один слот квоты. True — можно запускать.
+
+        Проверка и увеличение счётчика резервов идут под одним замком, поэтому
+        N параллельных вызовов не могут все увидеть «used < limit» и пройти.
+        Резерв снимается через release() при завершении/падении аудита; до
+        этого момента слот считается занятым (recorded-usage ещё не появился).
+        """
+        plan = self.get_plan(tenant_id)
+        category = category_for_kind(kind)
+        limit = plan.included.get(category)
+        period = current_period()
+
+        with self._lock:
+            recorded = self.usage_for_period(tenant_id, period)[category]
+            reserved = self._reservations.get((tenant_id, period, category), 0)
+            used = recorded + reserved
+
+            hard_cap = limit is not None and used >= limit and plan.overage_usd.get(category) is None
+            if hard_cap:
+                return QuotaCheck(
+                    False,
+                    plan.name,
+                    category,
+                    used,
+                    limit,
+                    reason=(
+                        f"Monthly quota exceeded: plan '{plan.name}' includes "
+                        f"{limit} {category}/month ({used} already used). "
+                        "Upgrade via POST /v1/billing/plan."
+                    ),
+                )
+
+            self._reservations[(tenant_id, period, category)] = reserved + 1
+
+        reason = ""
+        if limit is not None and used >= limit:
+            reason = "quota exceeded; overage billing applies"
+        return QuotaCheck(True, plan.name, category, used, limit, reason=reason)
+
+    def release(self, tenant_id: str, kind: str) -> None:
+        """Снимает один резерв (аудит завершён/упал). Ничего не делает, если
+        резерва не было — вызов идемпотентен и безопасен при повторе."""
+        category = category_for_kind(kind)
+        key = (tenant_id, current_period(), category)
+        with self._lock:
+            current = self._reservations.get(key, 0)
+            if current <= 0:
+                return
+            if current == 1:
+                self._reservations.pop(key, None)
+            else:
+                self._reservations[key] = current - 1
 
     def quota_status(self, tenant_id: str) -> dict[str, Any]:
         """Сводка квот по категориям за текущий период."""

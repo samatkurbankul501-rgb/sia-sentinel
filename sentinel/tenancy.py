@@ -180,8 +180,16 @@ class UsageMeter:
         mode: Optional[str] = None,
         savings_verified: Optional[bool] = None,
         savings_usd_per_1k: Optional[float] = None,
+        event_key: Optional[str] = None,
     ) -> dict[str, Any]:
-        """Записывает событие использования и возвращает его."""
+        """Записывает событие использования и возвращает его.
+
+        ``event_key`` делает запись идемпотентной: если событие с таким ключом
+        уже есть в jsonl, повторный вызов не дописывает вторую строку (возвращает
+        существующее). Это закрывает двойной учёт при recover(): джоб мог успеть
+        списать usage и упасть ДО записи completed — restart перезапустит его, и
+        без ключа usage списывается дважды за один audit_id.
+        """
         event = {
             "event_id": uuid.uuid4().hex,
             "tenant_id": tenant_id or DEFAULT_TENANT_ID,
@@ -191,8 +199,15 @@ class UsageMeter:
             "savings_usd_per_1k": savings_usd_per_1k,
             "recorded_at": _utcnow(),
         }
+        if event_key is not None:
+            event["event_key"] = event_key
 
         with self._lock:
+            if event_key is not None:
+                for existing in self._events():
+                    if existing.get("event_key") == event_key:
+                        return existing
+
             with open(self.usage_file, "a", encoding="utf-8") as handle:
                 handle.write(json.dumps(event, default=str) + "\n")
 

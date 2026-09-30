@@ -29,6 +29,7 @@ from sia.trust_level_manager import TrustLevelManager
 
 from .audit_jobs import AuditJobManager
 from .billing import PLANS, BillingEngine
+from .database import AuditJobRecord, get_db_session
 from .evidence_store import EvidenceStore
 from .github_client import GitHubClient
 from .outbound_webhooks import (
@@ -148,7 +149,7 @@ guard = ConstitutionalAILayer()
 evidence_store = EvidenceStore()
 policy_engine = PolicyEngine()
 
-_trust_managers: dict[str, TrustLevelManager] = {}
+_trust_managers: dict[tuple[str, str], TrustLevelManager] = {}
 
 
 class VerifyChangeRequest(BaseModel):
@@ -186,17 +187,26 @@ class TrustInfoResponse(BaseModel):
     last_failure_reason: Optional[str]
 
 
-def _get_trust_manager(agent_id: str) -> TrustLevelManager:
-    if agent_id not in _trust_managers:
-        Path("logs").mkdir(parents=True, exist_ok=True)
-        safe_id = _safe_agent_id(agent_id)
-        state_file = Path("logs") / f"trust_{safe_id}.json"
+def _get_trust_manager(agent_id: str, tenant_id: str = DEFAULT_TENANT_ID) -> TrustLevelManager:
+    """TrustLevelManager агента, ИЗОЛИРОВАННЫЙ ПО ТЕНАНТУ.
 
-        _trust_managers[agent_id] = TrustLevelManager(
+    Состояние доверия — это история конкретного тенанта: сколько раз его агенты
+    проходили/падали проверку. Раньше файл и кэш ключевались одним agent_id, и
+    два тенанта с одинаковым agent_id делили одну историю (и могли её читать/
+    портить друг другу). Ключ теперь (tenant_id, agent_id) — это и файл, и кэш.
+    """
+    cache_key = (tenant_id or DEFAULT_TENANT_ID, agent_id)
+    if cache_key not in _trust_managers:
+        Path("logs").mkdir(parents=True, exist_ok=True)
+        safe_tenant = _safe_agent_id(tenant_id or DEFAULT_TENANT_ID)
+        safe_id = _safe_agent_id(agent_id)
+        state_file = Path("logs") / f"trust_{safe_tenant}_{safe_id}.json"
+
+        _trust_managers[cache_key] = TrustLevelManager(
             state_file=str(state_file),
         )
 
-    return _trust_managers[agent_id]
+    return _trust_managers[cache_key]
 
 
 
@@ -226,7 +236,7 @@ def verify_change(
     # Квота биллинга: verify-change — тоже аудит (категория code)
     _check_quota_or_402(user.tenant_id, "code")
 
-    trust_manager = _get_trust_manager(request.agent_id)
+    trust_manager = _get_trust_manager(request.agent_id, user.tenant_id)
 
     allowed_paths = tuple(
         request.allowed_paths if request.allowed_paths else [request.target_path]
@@ -365,6 +375,10 @@ def calculate_risk_score(
     user: User = Depends(require_role(UserRole.ADMIN, UserRole.USER)),
 ) -> dict[str, Any]:
     """Legacy firewall endpoint — not part of the Proof-of-Savings surface."""
+    # Метарика квоты, как и у соседнего /v1/verify-change: без неё политика
+    # считалась бы неметрированной работой в обход месячного лимита.
+    _check_quota_or_402(user.tenant_id, "code")
+
     risk_assessment = policy_engine.assess_risk(
         agent_id=request.agent_id,
         target_path=request.target_path,
@@ -427,7 +441,7 @@ def get_agent_trust(
     agent_id: str,
     user: User = Depends(require_role(UserRole.ADMIN, UserRole.VERIFIER, UserRole.USER)),
 ) -> TrustInfoResponse:
-    trust_manager = _get_trust_manager(agent_id)
+    trust_manager = _get_trust_manager(agent_id, user.tenant_id)
 
     return TrustInfoResponse(
         agent_id=agent_id,
@@ -677,6 +691,44 @@ def _check_quota_or_402(tenant_id: str, kind: str) -> None:
         raise HTTPException(status_code=402, detail=check.reason)
 
 
+def _reserve_quota_or_402(tenant_id: str, kind: str) -> None:
+    """Атомарно резервирует слот квоты перед постановкой джоба в очередь.
+
+    Для асинхронного пути одной проверки недостаточно: usage списывается только
+    по завершении аудита, поэтому пачка параллельных submit'ов все прошли бы по
+    неинкрементированному счётчику. Резерв держит слот занятым до завершения;
+    снимается в _run_audit_and_register (успех) и _notify_audit_failure (падение).
+    """
+    check = billing_engine.reserve(tenant_id, kind)
+
+    if not check.allowed:
+        raise HTTPException(status_code=402, detail=check.reason)
+
+
+# Квотные резервы асинхронных джобов хранятся в billing_engine по ключу
+# (tenant, period, category). Снимать их нужно в обеих терминальных ветках
+# (успех/падение), зная (tenant, kind). Успех знает flow -> kind напрямую;
+# падение добирает kind из сохранённого flow_json джоба (см. _job_kind).
+# Ключ резерва — намеренно НЕ audit_id в памяти: воркер может завершиться
+# раньше, чем вызывающий успеет зарегистрировать audit_id, и такая запись осиротела
+# бы навсегда (слот квоты утекает до конца месяца). Резерв снимается по
+# производным данным джоба, поэтому гонки нет.
+
+
+def _job_kind(audit_id: str, default: str = "code") -> str:
+    """Достаёт kind джоба из сохранённого flow_json (для снятия резерва)."""
+    with get_db_session() as db:
+        record = (
+            db.query(AuditJobRecord)
+            .filter(AuditJobRecord.audit_id == audit_id)
+            .first()
+        )
+        if record is None:
+            return default
+        return (record.flow_json or {}).get("kind", default)
+
+
+
 class AuditRequest(BaseModel):
     flow: dict[str, Any] = Field(
         ...,
@@ -801,7 +853,19 @@ def _run_audit_and_register(
         mode=report.get("mode"),
         savings_verified=claim.get("savings_verified"),
         savings_usd_per_1k=claim.get("savings_usd_per_1k_calls"),
+        # Идемпотентный ключ для асинхронных джобов: audit_id переживает
+        # recover(), поэтому перезапуск после падения НЕ списывает usage второй
+        # раз. Синхронный путь audit_id пуст -> ключ не задаётся (обычная запись).
+        event_key=f"audit:{audit_id}" if audit_id else None,
     )
+
+    # Синхронный /v1/audit вызывает эту функцию без audit_id (audit_id == ""),
+    # и квоту для него резервировать не нужно — там точная синхронная проверка.
+    # Асинхронный воркер передаёт реальный audit_id: снимаем резерв, который
+    # держал слот от submit до завершения, чтобы не было двойного счёта
+    # (записанный usage + резерв).
+    if audit_id:
+        billing_engine.release(tenant_id, report.get("kind", "code"))
 
     webhook_dispatcher.dispatch(
         EVENT_AUDIT_COMPLETED,
@@ -826,7 +890,24 @@ def _run_audit_and_register(
 
 
 def _notify_audit_failure(audit_id: str, tenant_id: str, error: str) -> None:
-    """Исходящий webhook audit.failed (доставка fire-and-forget)."""
+    """Исходящий webhook audit.failed (доставка fire-and-forget).
+
+    Также снимает квотный резерв павшего асинхронного джоба: слот занимался
+    с момента submit и должен вернуться в лимит, иначе неудачные попытки
+    «съедают» месячную квоту тенанта. kind берётся из сохранённого flow_json.
+
+    Снятие резерва обёрнуто в try/except: это обработчик отказа, и сбой
+    биллинга (или чтения джоба из БД) не должен глушить webhook audit.failed —
+    иначе клиент вообще не узнает, что джоб упал.
+    """
+    try:
+        billing_engine.release(tenant_id, _job_kind(audit_id))
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"[quota-release] failed to release reservation for {audit_id}: {exc}",
+            file=sys.stderr,
+        )
+
     webhook_dispatcher.dispatch(
         EVENT_AUDIT_FAILED,
         {
@@ -962,7 +1043,7 @@ def submit_pos_audit(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    _check_quota_or_402(user.tenant_id, kind)
+    _reserve_quota_or_402(user.tenant_id, kind)
 
     audit_id = audit_job_manager.submit(flow, tenant_id=user.tenant_id)
 
@@ -1010,7 +1091,7 @@ def submit_optimization(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    _check_quota_or_402(user.tenant_id, "optimize")
+    _reserve_quota_or_402(user.tenant_id, "optimize")
 
     audit_id = audit_job_manager.submit(flow, tenant_id=user.tenant_id)
 
@@ -1192,6 +1273,21 @@ def create_tenant_api_key(
 
     if role == UserRole.ANONYMOUS:
         raise HTTPException(status_code=400, detail="Cannot create anonymous keys")
+
+    # VERIFIER — это фактически кросс-тенантное право чтения: _evidence_tenant_scope
+    # для этой роли снимает tenant-фильтр (api.py:402), т.е. ключ видит evidence,
+    # verifications и agent-history ВСЕХ тенантов. Выдать такое право из
+    # self-service нельзя, иначе любой тенант проходит «signup -> выпустить
+    # verifier-ключ -> читает аудиты конкурентов». Наружу роль выдаёт только
+    # платформенный админ (он и так держит is_platform_admin=True).
+    if role == UserRole.VERIFIER and not user.is_platform_admin:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Role 'verifier' grants cross-tenant read access and can only "
+                "be issued by a platform admin."
+            ),
+        )
 
     plain_key, key_obj = api_key_manager.create_key(
         name=request.name,
