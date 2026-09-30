@@ -9,9 +9,17 @@
 <pre>pip install sia-verifier
 
 sia-verifier attestation.json --chain registry.jsonl \
-  --checkpoint checkpoints.jsonl --require-coverage
+  --checkpoint checkpoints.jsonl --require-coverage \
+  --issuer-key tqIhnSC/3xVANUtzGLsGmcVqxZ40J1jTiF1QDaQHiyw=
 
 sia-rederive</pre>
+<p><strong><code>--issuer-key</code> is required.</strong> It is the issuer's
+public key obtained <em>out-of-band</em> (printed above, published in the
+attestation). The signature must be checked against a key you already trust —
+not against a key shipped inside the document under test, which would let
+anyone mint a &ldquo;valid&rdquo; forgery with a throwaway key. Without
+<code>--issuer-key</code> the verifier is fail-closed and never reports
+<code>VERDICT: VALID</code>.</p>
 <p>The chain, checkpoints and flows are in the repository
 (<code>receipts/</code>, <code>artifacts/</code>, <code>flows/</code>).
 The verifier checks the Ed25519 signature, the hash chain, signed

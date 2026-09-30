@@ -88,17 +88,44 @@ jobs:
     # записи ВЕРИФИЦИРУЮТСЯ в чистом окружении CI. PYTHONPATH вместо
     # pip-install: проверяем код из этого же checkout, не из PyPI.
     # --require-coverage: лаг чекпойнта — красный, не advisory.
+    # --issuer-key (2026-09-30): корень доверия. Без него верификатор берёт
+    # публичный ключ ИЗ проверяемой аттестации, и одноразовый ключ даёт
+    # «валидную» подделку. Якорь задаётся внеполосно, из шага CI.
     # rederive опущен: его проверка №2 дергает живой Rekor API —
     # сетевой сервис в CI-гейте остаётся вне зависимости.
     - name: Verify both public records as a fresh clone would
+      env:
+        ISSUER_KEY: tqIhnSC/3xVANUtzGLsGmcVqxZ40J1jTiF1QDaQHiyw=
       run: |
         pip install cryptography
         PYTHONPATH=verifier python -m sia_verifier artifacts/record1/attestation.json \
           --chain receipts/registry.jsonl \
-          --checkpoint receipts/checkpoints.jsonl --require-coverage
+          --checkpoint receipts/checkpoints.jsonl --require-coverage \
+          --issuer-key "$ISSUER_KEY"
         PYTHONPATH=verifier python -m sia_verifier artifacts/demo-live/attestation.json \
           --chain receipts/registry.jsonl \
-          --checkpoint receipts/checkpoints.jsonl --require-coverage
+          --checkpoint receipts/checkpoints.jsonl --require-coverage \
+          --issuer-key "$ISSUER_KEY"
+
+    # Негативный шаг: неверный якорь обязан ломать вердикт. Без него
+    # --issuer-key — декоративный флаг, который никто не проверяет.
+    - name: Trust anchor actually gates the verdict (negative check)
+      env:
+        ISSUER_KEY: tqIhnSC/3xVANUtzGLsGmcVqxZ40J1jTiF1QDaQHiyw=
+      run: |
+        pip install cryptography
+        set +e
+        PYTHONPATH=verifier python -m sia_verifier artifacts/record1/attestation.json \
+          --chain receipts/registry.jsonl \
+          --checkpoint receipts/checkpoints.jsonl --require-coverage \
+          --issuer-key "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        rc=$?
+        set -e
+        if [ "$rc" -eq 0 ]; then
+          echo "FATAL: wrong trust anchor still produced VERDICT: VALID"
+          exit 1
+        fi
+        echo "wrong anchor correctly rejected (exit $rc)"
 
   docker:
     needs: test

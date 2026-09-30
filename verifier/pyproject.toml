@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sia-verifier"
-version = "1.5.0"
+version = "1.6.0"
 description = "Independent verifier for sia-attestation/1 Proof-of-Savings attestations — no trust in the auditor required"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -31,7 +31,8 @@ sia-holdout = "sia_verifier.holdout:main"
 sia-replay = "sia_verifier.replay:main"
 
 [project.urls]
-Homepage = "https://github.com/sia-sentinel/sia-sentinel"
+Homepage = "https://github.com/Abzal-000/sia-sentinel"
+Repository = "https://github.com/Abzal-000/sia-sentinel"
 
 [tool.setuptools.packages.find]
 include = ["sia_verifier*"]

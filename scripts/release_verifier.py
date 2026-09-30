@@ -54,6 +54,9 @@ VERIFY_TARGETS = [
 ]
 CHAIN = "receipts/registry.jsonl"
 CHECKPOINTS = "receipts/checkpoints.jsonl"
+# Якорь доверия (2026-09-30): верификатор fail-closed без внешнего ключа
+# эмитента. Обе записи выпущены одним ключом; значение продублировано в CI.
+ISSUER_KEY = "tqIhnSC/3xVANUtzGLsGmcVqxZ40J1jTiF1QDaQHiyw="
 
 
 def _current_version() -> str:
@@ -150,7 +153,8 @@ def _verify_from_clean_venv(version: str, live_rekor: bool) -> None:
                  str(REPO_ROOT / att),
                  "--chain", str(REPO_ROOT / CHAIN),
                  "--checkpoint", str(REPO_ROOT / CHECKPOINTS),
-                 "--require-coverage"],
+                 "--require-coverage",
+                 "--issuer-key", ISSUER_KEY],
                 capture_output=True, text=True,
             )
             ok = r.returncode == 0 and "VERDICT: VALID" in r.stdout

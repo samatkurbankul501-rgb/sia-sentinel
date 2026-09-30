@@ -39,6 +39,12 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))          # sentinel.api — тексты портала
 sys.path.insert(0, str(REPO_ROOT / "verifier"))  # sia_verifier — вердикты
 
+# Якорь доверия для публичного вердикта портала: публичный ключ эмитента
+# (2026-09-30). Портал существует ради «проверь, не доверяя нам», поэтому
+# его вердикт обязан быть аутентифицирован против ЗАРАНЕЕ известного ключа,
+# а не против ключа из самого документа. Публичные записи выпущены одним ключом.
+ISSUER_PUBLIC_KEY = "tqIhnSC/3xVANUtzGLsGmcVqxZ40J1jTiF1QDaQHiyw="
+
 # Экспорт не сервер: секреты не нужны, но import sentinel.api поднимает
 # модуль целиком (auth предупреждает об эфемерном ключе и трогает пути
 # состояния). Изолируем до импорта — паттерн demo_full: экспорт не имеет
@@ -127,7 +133,10 @@ def _verify_record(attestation: dict) -> dict:
         if line.strip()
     ]
 
-    att = verify_attestation(attestation)
+    # Якорь доверия (2026-09-30): портал показывает публичный вердикт, значит
+    # он обязан быть аутентифицирован, а не «подпись верна под ключом из
+    # самого документа». Публичные записи выпущены одним известным ключом.
+    att = verify_attestation(attestation, expected_public_key=ISSUER_PUBLIC_KEY)
     chain = verify_chain(entries, attestation.get("attestation_id"))
     public_key = attestation["issuer"]["public_key"]
     checkpoints_valid = bool(attestations_checkpoint_ok(checkpoints, public_key))
@@ -278,9 +287,17 @@ def _verify_page() -> str:
 <pre>pip install sia-verifier
 
 sia-verifier attestation.json --chain registry.jsonl \\
-  --checkpoint checkpoints.jsonl --require-coverage
+  --checkpoint checkpoints.jsonl --require-coverage \\
+  --issuer-key tqIhnSC/3xVANUtzGLsGmcVqxZ40J1jTiF1QDaQHiyw=
 
 sia-rederive</pre>
+<p><strong><code>--issuer-key</code> is required.</strong> It is the issuer's
+public key obtained <em>out-of-band</em> (printed above, published in the
+attestation). The signature must be checked against a key you already trust —
+not against a key shipped inside the document under test, which would let
+anyone mint a &ldquo;valid&rdquo; forgery with a throwaway key. Without
+<code>--issuer-key</code> the verifier is fail-closed and never reports
+<code>VERDICT: VALID</code>.</p>
 <p>The chain, checkpoints and flows are in the repository
 (<code>receipts/</code>, <code>artifacts/</code>, <code>flows/</code>).
 The verifier checks the Ed25519 signature, the hash chain, signed
