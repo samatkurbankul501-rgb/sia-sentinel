@@ -283,13 +283,22 @@ class SentinelClient:
         """
         return self._get(f"/v1/receipts/{registry_id}/verify")
 
-    def verify_attestation_independent(self, registry_id: str) -> dict[str, Any]:
+    def verify_attestation_independent(
+        self, registry_id: str, issuer_key: str | None = None
+    ) -> dict[str, Any]:
         """Независимая верификация аттестации локально (без доверия к аудитору).
 
         Скачивает аттестационный документ и проверяет Ed25519-подпись
         квитанции и согласованность заявления локально через пакет
         ``sia-verifier`` — тот же, что используют третьи стороны.
         Поля verification.* сервера игнорируются.
+
+        ``issuer_key`` — публичный ключ эмитента (base64 raw 32 байта),
+        полученный ВНЕПОЛОСНО. Это корень доверия: без него подпись
+        проверяется против ключа из самого скачанного документа, а такой
+        ключ может принадлежать кому угодно (см. v1.6.0). Передайте ключ,
+        полученный из канала, которому доверяете, и проверьте
+        ``trust_established`` в ответе.
 
         Требует установленный sia-verifier: pip install sia-verifier.
         """
@@ -302,7 +311,20 @@ class SentinelClient:
             ) from exc
 
         attestation = self.get_attestation(registry_id)
-        return verify_attestation(attestation).to_dict()
+        verdict = verify_attestation(attestation, expected_public_key=issuer_key)
+        result = verdict.to_dict()
+
+        if issuer_key is None:
+            # Якорь не задан: подпись математически проверена, но эмитент не
+            # аутентифицирован. Предупреждаем явно, чтобы это не выглядело как
+            # полноценная независимая проверка.
+            result["warning"] = (
+                "no issuer_key supplied: the issuer public key was taken from the "
+                "attestation itself, so its authenticity is UNPROVEN. Pass "
+                "issuer_key (obtained out-of-band) and require trust_established."
+            )
+
+        return result
 
     def list_public_attestations(
         self, limit: int = 50, offset: int = 0

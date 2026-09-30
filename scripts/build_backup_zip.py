@@ -174,7 +174,8 @@ def _flash_drive_simulation(z: zipfile.ZipFile) -> str:
              str(tmp / "artifacts" / "record1" / "attestation.json"),
              "--chain", str(tmp / "receipts" / "registry.jsonl"),
              "--checkpoint", str(tmp / "receipts" / "checkpoints.jsonl"),
-             "--require-coverage"],
+             "--require-coverage",
+             "--issuer-key", "tqIhnSC/3xVANUtzGLsGmcVqxZ40J1jTiF1QDaQHiyw="],
             capture_output=True, text=True,
         )
         ok = r.returncode == 0 and "VERDICT: VALID" in r.stdout

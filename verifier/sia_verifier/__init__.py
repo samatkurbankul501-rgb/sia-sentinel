@@ -10,7 +10,12 @@ TrustChain. Никаких сетевых вызовов, никакого SDK S
 1. **Подпись квитанции** — Ed25519 (RFC 8032) над каноническим JSON
    коммитмента, восстановленного из полей квитанции (включая
    ``receipt_id``). Публичный ключ берётся из ``issuer.public_key``
-   аттестации и принимается только в виде base64 raw 32 байт.
+   аттестации, но **аутентифицируется внеполосным якорем**: если оператор
+   передал ``expected_public_key`` / ``--issuer-key``, ключ в документе
+   обязан совпасть, и только тогда ``trust_established=True``. Без якоря
+   проверка self-referential (одноразовый ключ дал бы валидную подделку),
+   поэтому CLI с 1.6.0 fail-closed. Ключ принимается только в виде base64
+   raw 32 байт.
 2. **Согласованность заявления** — ``receipt.safety_approved`` должен
    совпадать с ``claim.savings_verified``: подпись покрывает именно
    ``safety_approved``, поэтому расхождение означает подделку заявления.
@@ -23,9 +28,10 @@ TrustChain. Никаких сетевых вызовов, никакого SDK S
    включение записи в tree head, ``verify_consistency`` — что дерево
    размера N является продолжением дерева размера M.
 
-CLI (v1.5.0)::
+CLI (v1.6.0)::
 
-    sia-verifier attestation.json [--chain registry.jsonl] [--checkpoint cp.json]
+    sia-verifier attestation.json --issuer-key <BASE64_PUBKEY> \
+        [--chain registry.jsonl] [--checkpoint cp.json] [--require-coverage]
     sia-rederive  [--artifacts DIR] [--flow F] [--chain C] [--no-rekor]
     sia-replay    --flow F --record report1.json --replay report2.json
     sia-holdout   make|reveal|verify ...
@@ -58,7 +64,7 @@ from .core import (
     verify_receipt,
 )
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 __all__ = [
     "ATTESTATION_SPEC",

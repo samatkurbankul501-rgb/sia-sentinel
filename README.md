@@ -56,8 +56,13 @@ system can independently verify a savings claim without trusting the service.
   the chain (key rotation). No network calls.
 
   ```bash
-  sia-verifier attestation.json --chain registry.jsonl
+  sia-verifier attestation.json --chain registry.jsonl \
+    --issuer-key <BASE64_PUBKEY>
   ```
+
+  `--issuer-key` is the trust anchor: the issuer's public key obtained
+  **out-of-band**, not from the document being verified. Without it the
+  verifier is fail-closed and will not report `VERDICT: VALID` (v1.6.0+).
 
   Walkthrough: [`docs/verify-in-5-minutes.md`](docs/verify-in-5-minutes.md).
 - **Verification portal:** `GET /attestations/{id}` renders a human verdict
@@ -340,7 +345,7 @@ sentinel/       API service: auth, tenancy, billing, jobs, receipts, ledger, web
 sdk/            Client SDK (sia_sentinel)
 flows/          Flow declarations (code | llm_flow | optimize)
 docs/           Attestation spec, JSON Schema, record-1 re-verification guide, holdout design, demand validation + outreach drafts
-tests/          794 tests (unittest)
+tests/          821 tests (unittest)
 dashboard/      Streamlit dashboard
 audit_cli.py    CLI: audit / optimize / sign / verify
 ```
@@ -349,7 +354,7 @@ audit_cli.py    CLI: audit / optimize / sign / verify
 
 Prototype-stage, fully working core: the first publicly anchored record
 (beacon, Groq, 50.5% verified savings, non-inferior verdict — see the
-Record №1 section above) plus 794 tests covering the audit engine, ledger,
+Record №1 section above) plus 821 tests covering the audit engine, ledger,
 tenancy, billing, jobs persistence, public attestation network,
 self-service onboarding, the independent verifier (including verdict
 re-derivation and the auditor-side holdout tool), and the SDK. Measured

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import json
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -50,6 +51,27 @@ def _load_public_key(value: str) -> Ed25519PublicKey:
         raise ValueError(f"issuer.public_key must decode to exactly 32 bytes, got {len(raw)}")
 
     return Ed25519PublicKey.from_public_bytes(raw)
+
+
+def _keys_equal(presented_b64: str, expected_b64: str) -> bool:
+    """Строгое сравнение base64-ключей в постоянном времени.
+
+    Сравниваются ДЕКОДИРОВАННЫЕ байты, а не текст: это снимает расхождения
+    кодирования (одинаковый ключ, разный base64-представление) и даёт
+    constant-time семантику через hmac.compare_digest. Если оба значения
+    не декодируются как 32-байтовый raw Ed25519-ключ, сравнение даёт False —
+    «мусор» не приравнивается к ключу.
+    """
+    try:
+        presented = base64.b64decode(presented_b64, validate=True)
+        expected = base64.b64decode(expected_b64, validate=True)
+    except Exception:
+        return False
+
+    if len(presented) != 32 or len(expected) != 32:
+        return False
+
+    return hmac.compare_digest(presented, expected)
 
 
 def _receipt_commitment(receipt: dict[str, Any]) -> bytes:
@@ -95,12 +117,20 @@ def verify_receipt(receipt: dict[str, Any], public_key_b64: str) -> bool:
 
 @dataclass
 class AttestationVerdict:
-    """Результат независимой проверки аттестации."""
+    """Результат независимой проверки аттестации.
+
+    ``trust_established`` (2026-09-30): подпись действительна САМА ПО СЕБЕ
+    недостаточна — без операторского якоря доверия эмитент не аутентифицирован
+    (одноразовый ключ даёт валидную подпись). Это поле делает различие
+    явным: valid=True + trust_established=False означает «подпись корректна,
+    но кто её выпустил — не доказано».
+    """
 
     valid: bool
     receipt_signature_valid: bool
     claim_consistent: bool
     spec_recognized: bool
+    trust_established: bool = False
     reasons: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -109,17 +139,28 @@ class AttestationVerdict:
             "receipt_signature_valid": self.receipt_signature_valid,
             "claim_consistent": self.claim_consistent,
             "spec_recognized": self.spec_recognized,
+            "trust_established": self.trust_established,
             "reasons": list(self.reasons),
         }
 
 
-def verify_attestation(attestation: dict[str, Any]) -> AttestationVerdict:
+def verify_attestation(
+    attestation: dict[str, Any],
+    expected_public_key: Optional[str] = None,
+) -> AttestationVerdict:
     """Независимая проверка аттестационного документа.
 
-    Проверяет подпись квитанции публичным ключом из самого документа и
-    согласованность заявления с подписанным полем ``safety_approved``.
-    Поля ``verification.*`` сервера намеренно игнорируются — они не
-    входят в подписанный коммитмент и не являются доказательством.
+    Проверяет подпись квитанции публичным ключом и согласованность
+    заявления с подписанным полем ``safety_approved``. Поля ``verification.*``
+    сервера намеренно игнорируются — они не входят в подписанный коммитмент и
+    не являются доказательством.
+
+    Корень доверия (2026-09-30): если передан ``expected_public_key``
+    (внеполосный, заранее известный оператору публичный ключ эмитента), ключ в
+    артефакте обязан совпасть с ним — и только тогда доверие установлено
+    (``trust_established=True``). Без якоря проверка self-referential: подпись
+    корректна, но эмитент не аутентифицирован (одноразовый ключ злоумышленника
+    дал бы ``valid=True``).
     """
     reasons: list[str] = []
 
@@ -127,6 +168,22 @@ def verify_attestation(attestation: dict[str, Any]) -> AttestationVerdict:
     spec_recognized = spec == ATTESTATION_SPEC
     if not spec_recognized:
         reasons.append(f"unrecognized spec: {spec!r} (expected {ATTESTATION_SPEC!r})")
+
+    issuer = attestation.get("issuer") or {}
+    public_key_b64 = issuer.get("public_key", "")
+    trust_established = False
+    trust_anchor_failed = False
+
+    if expected_public_key is not None:
+        if _keys_equal(public_key_b64, expected_public_key):
+            trust_established = True
+        else:
+            reasons.append("issuer key does not match operator-supplied trust anchor")
+            # Якорь задан, но не совпал: эмитент не тот, за кого себя выдаёт.
+            # Подпись может быть математически корректной (одноразовый ключ
+            # злоумышленника), но аутентификация эмитента провалена — вердикт
+            # обязан быть False, а не просто сопровождаться причиной.
+            trust_anchor_failed = True
 
     receipt = attestation.get("receipt")
     if not isinstance(receipt, dict):
@@ -136,11 +193,9 @@ def verify_attestation(attestation: dict[str, Any]) -> AttestationVerdict:
             receipt_signature_valid=False,
             claim_consistent=False,
             spec_recognized=spec_recognized,
+            trust_established=trust_established,
             reasons=reasons,
         )
-
-    issuer = attestation.get("issuer") or {}
-    public_key_b64 = issuer.get("public_key", "")
 
     signature_valid = verify_receipt(receipt, public_key_b64)
     if not signature_valid:
@@ -153,13 +208,19 @@ def verify_attestation(attestation: dict[str, Any]) -> AttestationVerdict:
             "claim.savings_verified does not match signed receipt.safety_approved"
         )
 
-    valid = signature_valid and claim_consistent and spec_recognized
+    valid = (
+        signature_valid
+        and claim_consistent
+        and spec_recognized
+        and not trust_anchor_failed
+    )
 
     return AttestationVerdict(
         valid=valid,
         receipt_signature_valid=signature_valid,
         claim_consistent=claim_consistent,
         spec_recognized=spec_recognized,
+        trust_established=trust_established,
         reasons=reasons,
     )
 

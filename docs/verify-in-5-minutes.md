@@ -28,7 +28,7 @@ pip install sia-verifier
 ## Шаг 1. Запустите верификатор
 
 ```bash
-sia-verifier attestation.json
+sia-verifier attestation.json --issuer-key <КЛЮЧ_ЭМИТЕНТА>
 ```
 
 Вы увидите вердикт:
@@ -38,10 +38,34 @@ spec:                 sia-attestation/1
 attestation_id:       77f49f07c00f4f52b9810db7bedb308e
 receipt signature:    VALID
 claim consistent:     yes
+issuer trust:         ESTABLISHED (operator trust anchor matched)
 VERDICT: VALID
 ```
 
 Код выхода `0` — аттестация валидна (можно встраивать в CI), `1` — невалидна.
+
+### Зачем нужен `--issuer-key` (обязателен с 2026-09-30)
+
+**Это главное, что делает проверку независимой.** Без якоря верификатор берёт
+публичный ключ **из самой аттестации** — а тогда любой может сгенерировать
+одноразовый ключ, подписать поддельную квитанцию «на 99% экономии» и получить
+`VERDICT: VALID`. Подпись была бы математически корректной, но эмитент не был
+бы аутентифицирован.
+
+`--issuer-key` — это ключ, полученный **внеполосно** (из канала, которому вы
+доверяете: подпись издателя, ранее известный отпечаток). Тогда подпись
+проверяется против ключа, который вы независимо знаете, а не который пришёл в
+проверяемом файле.
+
+Правила поведения вердификатора:
+- **с `--issuer-key`:** ключ в аттестации обязан совпасть; не совпал → `INVALID`.
+- **без `--issuer-key`:** вердикт **не будет `VALID`** (fail-closed) — печатается
+  `issuer trust: NOT ESTABLISHED`. Для отладки есть `--allow-self-declared-key`,
+  но контрагенту его использовать нельзя.
+
+> ⚠️ Это поведение изменилось в версии **1.4.0**. Если ваш скрипт проверял
+> запись без якоря и раньше получал `VERDICT: VALID`, он теперь честно падает —
+> обновитесь и передавайте ключ.
 
 ## Шаг 2. Что именно проверено
 
@@ -62,7 +86,7 @@ VERDICT: VALID
 вставлена и не подменена:
 
 ```bash
-sia-verifier attestation.json --chain registry.jsonl
+sia-verifier attestation.json --chain registry.jsonl --issuer-key <КЛЮЧ_ЭМИТЕНТА>
 ```
 
 Верификатор пересчитает хеш каждой записи и подтвердит, что аттестация
@@ -75,7 +99,8 @@ sia-verifier attestation.json --chain registry.jsonl
 источнике, он фиксирует состояние журнала на момент времени:
 
 ```bash
-sia-verifier attestation.json --checkpoint checkpoint.json
+sia-verifier attestation.json --checkpoint checkpoint.json \
+  --issuer-key <КЛЮЧ_ЭМИТЕНТА>
 ```
 
 ## Шаг 5 (усиление). Проверьте включение в Merkle tree head
@@ -133,18 +158,21 @@ import json
 from sia_verifier import verify_attestation
 
 attestation = json.load(open("attestation.json"))
-verdict = verify_attestation(attestation)
+# ключ эмитента, полученный ВНЕПОЛОСНО (не из проверяемого документа)
+verdict = verify_attestation(attestation, expected_public_key="<КЛЮЧ_ЭМИТЕНТА>")
 
 assert verdict.valid, verdict.reasons
+assert verdict.trust_established  # эмитент аутентифицирован якорем
 ```
 
 ## Итого
 
 | Проверка | Команда | Что доказывает |
 |---|---|---|
-| Подпись + заявление | `sia-verifier attestation.json` | Квитанция подлинная, заявление не подделано |
+| Якорь доверия | `--issuer-key <КЛЮЧ>` | Кто выпустил квитанцию — не самообъявленный ключ |
+| Подпись + заявление | `sia-verifier attestation.json --issuer-key <КЛЮЧ>` | Квитанция подлинная, заявление не подделано |
 | + цепочка | `... --chain registry.jsonl` | Запись не удалена/подменена в журнале |
-| + чекпоинт | `... --checkpoint checkpoint.json` | Состояние журнала зафиксировано на дату |
+| + чекпоинт | `... --checkpoint checkpoint.json --require-coverage` | Состояние журнала зафиксировано на дату |
 | + включение | `client.verify_inclusion(id)` | Запись входит в подписанный Merkle tree head |
 | + согласованность | `verify_consistency(from, to)` | История дополнялась, но не переписывалась |
 

@@ -87,6 +87,11 @@ class SiaVerifierTestCase(unittest.TestCase):
         self.entry = self.registry.get(self.registry_id)
         self.attestation = _build_attestation(self.entry, self.public_key)
 
+        # Якорь доверия для CLI-тестов (2026-09-30): CLI fail-closed без
+        # --issuer-key, поэтому тесты, ожидающие VALID, передают тот же ключ,
+        # которым подписана их собственная аттестация.
+        self._anchor = ["--issuer-key", self.public_key]
+
     def tearDown(self) -> None:
         self._tmp.cleanup()
 
@@ -228,7 +233,7 @@ class SiaVerifierTestCase(unittest.TestCase):
         att_path = Path(self._tmp.name) / "attestation.json"
         att_path.write_text(json.dumps(self.attestation), encoding="utf-8")
 
-        self.assertEqual(verifier_main([str(att_path)]), 0)
+        self.assertEqual(verifier_main([str(att_path), *self._anchor]), 0)
 
     def test_cli_invalid_exit_one(self) -> None:
         forged = json.loads(json.dumps(self.attestation))
@@ -247,7 +252,7 @@ class SiaVerifierTestCase(unittest.TestCase):
             encoding="utf-8",
         )
 
-        self.assertEqual(verifier_main([str(att_path), "--chain", str(chain_path)]), 0)
+        self.assertEqual(verifier_main([str(att_path), "--chain", str(chain_path), *self._anchor]), 0)
 
     def test_cli_missing_file_exit_two(self) -> None:
         self.assertEqual(verifier_main(["/nonexistent/attestation.json"]), 2)
@@ -261,6 +266,7 @@ class SiaVerifierTestCase(unittest.TestCase):
         self.assertEqual(
             verifier_main([
                 str(att_path), "--checkpoint", str(self.registry.checkpoint_file),
+                *self._anchor,
             ]),
             0,
         )
@@ -296,7 +302,7 @@ class SiaVerifierTestCase(unittest.TestCase):
         cp_path.write_text(json.dumps(checkpoint, indent=2), encoding="utf-8")
 
         self.assertEqual(
-            verifier_main([str(att_path), "--checkpoint", str(cp_path)]),
+            verifier_main([str(att_path), "--checkpoint", str(cp_path), *self._anchor]),
             0,
         )
 
@@ -333,6 +339,7 @@ class SiaVerifierTestCase(unittest.TestCase):
             verifier_main([
                 str(att_path), "--chain", str(chain_path),
                 "--checkpoint", str(self.registry.checkpoint_file),
+                *self._anchor,
             ]),
             0,
         )
@@ -377,7 +384,7 @@ class SiaVerifierTestCase(unittest.TestCase):
         )
 
         self.assertEqual(
-            verifier_main([str(att_path), "--checkpoint", str(cp_path)]),
+            verifier_main([str(att_path), "--checkpoint", str(cp_path), *self._anchor]),
             0,
         )
 
@@ -387,7 +394,7 @@ class SiaVerifierTestCase(unittest.TestCase):
             b"\xef\xbb\xbf" + json.dumps(self.attestation).encode("utf-8")
         )
 
-        self.assertEqual(verifier_main([str(att_path)]), 0)
+        self.assertEqual(verifier_main([str(att_path), *self._anchor]), 0)
 
 
 if __name__ == "__main__":

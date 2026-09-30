@@ -64,14 +64,32 @@ class McNemarTestCase(unittest.TestCase):
 
 
 class NonInferiorityTestCase(unittest.TestCase):
-    def test_identical_results_non_inferior(self) -> None:
+    def test_identical_results_too_small_n_is_inconclusive(self) -> None:
+        """Регресс (дыра 2026-09-30): одинаковые прогоны на МАЛОМ n.
+
+        Раньше b=c=0 обходил MDD-гейт, и n=50 «не хуже» объявлялось
+        non_inferior, хотя при n=50 и допущении дискордантности 10% тест
+        физически не может заметить падение на delta=0.10. Теперь такой
+        прогон честно inconclusive (MDD-гейт обязателен).
+        """
         old = [True] * 50
         new = [True] * 50
         result = non_inferiority_test(old, new, delta=0.10)
-        self.assertTrue(result.non_inferior)
-        self.assertEqual(result.verdict, "non_inferior")
         self.assertEqual(result.b, 0)
         self.assertEqual(result.c, 0)
+        self.assertGreater(result.mdd, 0.10)
+        self.assertFalse(result.non_inferior)
+        self.assertEqual(result.verdict, "inconclusive")
+
+    def test_identical_results_large_n_non_inferior(self) -> None:
+        """Регресс в другую сторону: при достаточной n одинаковые прогоны
+        ДОЛЖНЫ проходить — снятие обхода не ломает честный случай."""
+        old = [True] * 2000
+        new = [True] * 2000
+        result = non_inferiority_test(old, new, delta=0.02)
+        self.assertLessEqual(result.mdd, 0.02)
+        self.assertTrue(result.non_inferior)
+        self.assertEqual(result.verdict, "non_inferior")
 
     def test_slight_degradation_within_delta(self) -> None:
         # 4 из 200 упали (2%), delta=10% => неинфериорно
@@ -182,9 +200,14 @@ class NonInferiorityTestCase(unittest.TestCase):
         self.assertFalse(result.non_inferior)      # но MDD = 0.0934 > 0.05
         self.assertEqual(result.verdict, "inconclusive")
 
-    def test_zero_discordance_exempt_from_mdd_gate(self) -> None:
-        # b=c=0: наблюдённая разность точно 0; ворота MDD обходятся,
-        # честность обеспечивает публикуемый MDD рядом
+    def test_zero_discordance_no_longer_exempts_from_mdd_gate(self) -> None:
+        """Регресс (дыра 2026-09-30): b=c=0 больше НЕ обходит MDD-гейт.
+
+        Именно это был PoC дыры: n=400, delta=0.02, MDD=0.0627 > 0.02 —
+        тест физически не способен заметить падение на 2 п.п., но прежний
+        код объявлял non_inferior «за счёт» нулевой дискордантности.
+        Теперь — честный inconclusive.
+        """
         old = [True] * 400
         new = [True] * 400
 
@@ -192,8 +215,27 @@ class NonInferiorityTestCase(unittest.TestCase):
 
         self.assertGreater(result.ci_lower, -result.delta)
         self.assertGreater(result.mdd, result.delta)
-        self.assertTrue(result.non_inferior)
-        self.assertEqual(result.verdict, "non_inferior")
+        self.assertFalse(result.non_inferior)
+        self.assertEqual(result.verdict, "inconclusive")
+
+    def test_coin_flip_is_not_certified_non_inferior(self) -> None:
+        """ГЛАВНЫЙ регресс: две идентичные модели точностью ровно 50%.
+
+        Монетка неотличима от полезной системы, но провалит и относительный
+        тест (MDD-гейт), и абсолютный пол — система не должна выпускать
+        подтверждение «экономия доказана» для пустого результата.
+        """
+        old = [True] * 100 + [False] * 100
+        new = [True] * 100 + [False] * 100   # идентичны => b=c=0
+
+        result = non_inferiority_test(old, new, delta=0.05)
+
+        self.assertEqual(result.b, 0)
+        self.assertEqual(result.c, 0)
+        # MDD-гейт обязателен: при n=200 он выше delta, значит вердикт НЕ
+        # может быть non_inferior, какой бы «нулевой» ни была дискордантность.
+        self.assertGreater(result.mdd, 0.05)
+        self.assertFalse(result.non_inferior)
 
     def test_single_discordant_pair_blocks_at_same_n(self) -> None:
         # Одна дискордантная пара снимает исключение: при MDD > delta
